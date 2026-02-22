@@ -3,7 +3,6 @@
 // ProxyIP and WebSocket Transport
 // By Dr. Upendra
 //-----------------------------------------------------------------------------
-
 import { connect } from "cloudflare:sockets";
 
 // Global reusable encoder/decoder.
@@ -17,15 +16,18 @@ const textDecoder = new TextDecoder();
 let password = "";
 let sha224Password;
 let proxyIP = "";
-
 let keepaliveMs = 0;
-
 let enableECH = true;
 let customDNS = 'https://cloudflare-dns.com/dns-query';
 let customECHDomain = 'cloudflare-ech.com';
 
 // Global variable to store ECH debug info
 let echDebugInfo = '';
+
+// Subscription converter URL (can be overridden via KV key 'SCU')
+let scu = 'https://url.v1.mk/sub';
+// Remote Clash rule config URL
+const remoteConfigUrl = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
 
 //-----------------------------------------------------------------------------
 // Backup ProxyIP pool — nearest server selected automatically per request
@@ -276,53 +278,56 @@ export default {
         return serveHomepage(env);
       }
 
-      // Trojan configuration endpoint.
+      // Trojan configuration page: /<password>
+      // Returns a styled HTML page showing the trojan link, V2Ray sub link, and Clash sub link.
       if (reqUrl.pathname === `/${password}`) {
         const hostName = request.headers.get("Host") || "example.com";
-        
-        // Build base Trojan link params
-        const params = new URLSearchParams({
-          type: "ws",
-          host: hostName,
-          path: "/api/v1/health",
-          security: "tls",
-          sni: hostName,
-          alpn: "h3",
-          fp: "chrome",
-          allowInsecure: "0",
-          fastopen: "true",
-          earlyDataSize: "0",
+        return new Response(serveConfigPage(password, hostName), {
+          status: 200,
+          headers: {
+            "Content-Type": "text/html;charset=utf-8",
+            "X-ECH-Status": "ENABLED",
+          },
         });
-
-        // ECH param always included (ECH is on by default)
-        const echDomain = customECHDomain || 'cloudflare-ech.com';
-        const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
-        params.set('ech', `${echDomain}+${dnsServer}`);
-
-        const trojanConfig = `trojan://${encodeURIComponent(password)}@${hostName}:443/?${params.toString()}`;
-        
-        const headers = new Headers({
-          "Content-Type": "text/plain;charset=utf-8",
-          Connection: "keep-alive",
-          "X-Content-Type-Options": "nosniff",
-          "X-ECH-Status": "ENABLED",
-        });
-        return new Response(trojanConfig, { status: 200, headers });
       }
 
-      // ECH subscription endpoint: /<password>/sub
-      // Returns a Trojan link (with ECH params if enabled) suitable for import into clients.
+      // Subscription endpoint: /<password>/sub
+      // ?target=clash  → Clash YAML via converter
+      // ?target=base64 → raw base64 (used internally by clash converter)
+      // default        → base64 nodes (V2Ray / universal)
       if (reqUrl.pathname === `/${password}/sub`) {
         const hostName = request.headers.get("Host") || "example.com";
-        const trojanLink = buildTrojanLink(password, hostName);
-        const responseHeaders = new Headers({
-          "Content-Type": "text/plain;charset=utf-8",
-          Connection: "keep-alive",
-          "X-Content-Type-Options": "nosniff",
-          "X-ECH-Status": "ENABLED",
-          "X-ECH-Domain": customECHDomain || 'cloudflare-ech.com',
+        const target = (reqUrl.searchParams.get("target") || "").toLowerCase();
+        const nodes = generateTrojanNodes(password, hostName);
+        const base64Content = btoa(nodes.join("\n"));
+
+        if (target === "clash") {
+          try {
+            const clashYaml = await generateClashConfig(nodes, request, password, hostName);
+            return new Response(clashYaml, {
+              status: 200,
+              headers: {
+                "Content-Type": "text/yaml;charset=utf-8",
+                "Cache-Control": "no-store",
+                "X-ECH-Status": "ENABLED",
+              },
+            });
+          } catch (err) {
+            return new Response(`# Clash config generation failed: ${err.message}`, {
+              status: 502,
+              headers: { "Content-Type": "text/yaml;charset=utf-8" },
+            });
+          }
+        }
+
+        return new Response(base64Content, {
+          status: 200,
+          headers: {
+            "Content-Type": "text/plain;charset=utf-8",
+            "Cache-Control": "no-store",
+            "X-ECH-Status": "ENABLED",
+          },
         });
-        return new Response(trojanLink, { status: 200, headers: responseHeaders });
       }
 
       // ECH status/debug endpoint: /<password>/ech-status
@@ -1251,7 +1256,285 @@ function safeCloseWebSocket(socket, code = 1000, reason = '') {
 }
 
 //-----------------------------------------------------------------------------
-// Build Trojan Link (with optional ECH params)
+// Generate Trojan nodes for all backupIPs + worker hostname
+// Returns an array of trojan:// URI strings.
+//-----------------------------------------------------------------------------
+function generateTrojanNodes(pwd, hostName) {
+  const echDomain = customECHDomain || 'cloudflare-ech.com';
+  const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+  const echParam = encodeURIComponent(`${echDomain}+${dnsServer}`);
+  const wsPath = encodeURIComponent('/api/v1/health');
+  const links = [];
+
+  // 1. Primary node — the worker hostname itself on port 443
+  const primaryParams = new URLSearchParams({
+    security: 'tls', sni: hostName, fp: 'chrome',
+    type: 'ws', host: hostName, path: '/api/v1/health',
+    alpn: 'h3,h2,http/1.1',
+    ech: `${echDomain}+${dnsServer}`,
+  });
+  links.push(`trojan://${encodeURIComponent(pwd)}@${hostName}:443?${primaryParams.toString()}#${encodeURIComponent('🌐 ' + hostName)}`);
+
+  // 2. One node per backupIP, sorted by proximity to the current worker region
+  const sorted = getSortedBackupIPs(currentWorkerRegion);
+  for (const b of sorted) {
+    const label = `🔁 ProxyIP-${b.regionCode || b.domain.split('.')[1] || 'relay'}`;
+    const params = new URLSearchParams({
+      security: 'tls', sni: hostName, fp: 'chrome',
+      type: 'ws', host: hostName, path: '/api/v1/health',
+      alpn: 'h3,h2,http/1.1',
+      ech: `${echDomain}+${dnsServer}`,
+    });
+    links.push(`trojan://${encodeURIComponent(pwd)}@${b.domain}:${b.port}?${params.toString()}#${encodeURIComponent(label)}`);
+  }
+
+  return links;
+}
+
+//-----------------------------------------------------------------------------
+// Generate Clash YAML via the subscription converter service
+//-----------------------------------------------------------------------------
+async function generateClashConfig(nodes, request, pwd, hostName) {
+  // Build the base64 sub URL pointing back to this worker
+  const subUrl = new URL(request.url);
+  subUrl.pathname = `/${pwd}/sub`;
+  subUrl.search = '?target=base64';
+  const encodedSubUrl = encodeURIComponent(subUrl.toString());
+  const converterUrl = `${scu}?target=clash&url=${encodedSubUrl}&insert=false&config=${encodeURIComponent(remoteConfigUrl)}&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true`;
+
+  const response = await fetch(converterUrl);
+  if (!response.ok) throw new Error(`Converter returned ${response.status}`);
+
+  let clashConfig = await response.text();
+
+  // Inject ech-opts into every proxy node line
+  const echDomain = customECHDomain || 'cloudflare-ech.com';
+  clashConfig = clashConfig.split('\n').map(line => {
+    if (/^\s*-\s*\{/.test(line) && line.includes('name:') && line.includes('server:')) {
+      if (line.includes('ech-opts')) return line;
+      const lastBrace = line.lastIndexOf('}');
+      if (lastBrace > 0) {
+        const before = line.substring(0, lastBrace).trim();
+        const needsComma = !before.endsWith(',') && !before.endsWith('{');
+        return line.substring(0, lastBrace) +
+          (needsComma ? ', ' : ' ') +
+          `ech-opts: {enable: true, query-server-name: ${echDomain}}` +
+          line.substring(lastBrace);
+      }
+    }
+    return line;
+  }).join('\n');
+
+  // Replace DNS nameserver with the configured DoH
+  const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+  clashConfig = clashConfig.replace(
+    /^(\s*nameserver:\s*\n)((?:\s*-\s*[^\n]+\n)*)/m,
+    (_, header) => header + `    - ${dnsServer}\n`
+  );
+
+  return clashConfig;
+}
+
+//-----------------------------------------------------------------------------
+// Serve the Trojan config page with V2Ray and Clash subscription links
+//-----------------------------------------------------------------------------
+function serveConfigPage(pwd, hostName) {
+  const subBase = `https://${hostName}/${pwd}/sub`;
+  const v2rayLink = subBase;                           // base64 — universal V2Ray import
+  const clashLink = `${scu}?target=clash&url=${encodeURIComponent(subBase + '?target=base64')}&insert=false&config=${encodeURIComponent(remoteConfigUrl)}&emoji=true&list=false&xudp=false&udp=false&tfo=false&expand=true&scv=false&fdn=false&new_name=true`;
+  const trojanLink = buildTrojanLink(pwd, hostName);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trojan Config</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@700;800&display=swap');
+  :root {
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --border: #1e1e2e;
+    --accent: #7c3aed;
+    --accent2: #06b6d4;
+    --text: #e2e8f0;
+    --muted: #64748b;
+    --success: #10b981;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 20% 20%, rgba(124,58,237,0.08) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 40% at 80% 80%, rgba(6,182,212,0.06) 0%, transparent 60%);
+  }
+  .container { max-width: 720px; width: 100%; }
+  .header { margin-bottom: 2.5rem; }
+  .header h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    background: linear-gradient(135deg, #7c3aed, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 0.4rem;
+  }
+  .header p { color: var(--muted); font-size: 0.8rem; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.4rem;
+    background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3);
+    color: var(--success); padding: 0.25rem 0.75rem; border-radius: 999px;
+    font-size: 0.7rem; font-weight: 600; margin-top: 0.75rem;
+    letter-spacing: 0.05em; text-transform: uppercase;
+  }
+  .badge::before { content: '●'; font-size: 0.6rem; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s;
+  }
+  .card:hover { border-color: #2a2a3e; }
+  .card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+  }
+  .card.trojan::before { background: linear-gradient(90deg, #7c3aed, transparent); }
+  .card.v2ray::before  { background: linear-gradient(90deg, #06b6d4, transparent); }
+  .card.clash::before  { background: linear-gradient(90deg, #f59e0b, transparent); }
+  .card-label {
+    font-size: 0.65rem; font-weight: 700; letter-spacing: 0.12em;
+    text-transform: uppercase; margin-bottom: 0.75rem;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .card.trojan .card-label { color: #7c3aed; }
+  .card.v2ray  .card-label { color: #06b6d4; }
+  .card.clash  .card-label { color: #f59e0b; }
+  .link-row {
+    display: flex; align-items: stretch; gap: 0.5rem;
+  }
+  .link-box {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    word-break: break-all;
+    line-height: 1.5;
+    cursor: text;
+    user-select: all;
+    transition: border-color 0.2s, color 0.2s;
+    min-height: 3rem;
+    display: flex;
+    align-items: center;
+  }
+  .link-box:focus-within,
+  .link-box:hover { border-color: #2a2a3e; color: var(--text); }
+  .copy-btn {
+    background: rgba(124,58,237,0.15);
+    border: 1px solid rgba(124,58,237,0.3);
+    color: #7c3aed;
+    border-radius: 8px;
+    padding: 0 1rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+    letter-spacing: 0.05em;
+  }
+  .copy-btn:hover { background: rgba(124,58,237,0.25); border-color: #7c3aed; }
+  .copy-btn.v { background: rgba(6,182,212,0.15); border-color: rgba(6,182,212,0.3); color: #06b6d4; }
+  .copy-btn.v:hover { background: rgba(6,182,212,0.25); border-color: #06b6d4; }
+  .copy-btn.c { background: rgba(245,158,11,0.15); border-color: rgba(245,158,11,0.3); color: #f59e0b; }
+  .copy-btn.c:hover { background: rgba(245,158,11,0.25); border-color: #f59e0b; }
+  .copy-btn.copied { color: var(--success) !important; border-color: var(--success) !important; }
+  .hint {
+    margin-top: 0.6rem;
+    font-size: 0.65rem;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+  .footer {
+    margin-top: 2rem;
+    text-align: center;
+    font-size: 0.65rem;
+    color: #2a2a3e;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>Trojan Config</h1>
+    <p>${hostName}</p>
+    <div class="badge">ECH Enabled · ${currentWorkerRegion || 'Global'}</div>
+  </div>
+
+  <div class="card trojan">
+    <div class="card-label">⬡ Trojan Link</div>
+    <div class="link-row">
+      <div class="link-box" id="trojan-box">${trojanLink}</div>
+      <button class="copy-btn" onclick="copy('trojan-box', this)">COPY</button>
+    </div>
+    <div class="hint">Single node — import directly into any Trojan/V2RayN/Clash client.</div>
+  </div>
+
+  <div class="card v2ray">
+    <div class="card-label">⬡ V2Ray Subscription</div>
+    <div class="link-row">
+      <div class="link-box" id="v2ray-box">${v2rayLink}</div>
+      <button class="copy-btn v" onclick="copy('v2ray-box', this)">COPY</button>
+    </div>
+    <div class="hint">Base64 sub — ${sorted_count} nodes (worker + all regional backupIPs). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
+  </div>
+
+  <div class="card clash">
+    <div class="card-label">⬡ Clash Subscription</div>
+    <div class="link-row">
+      <div class="link-box" id="clash-box">${clashLink}</div>
+      <button class="copy-btn c" onclick="copy('clash-box', this)">COPY</button>
+    </div>
+    <div class="hint">Clash YAML via url.v1.mk converter · ECH injected · rule config from byJoey/test.</div>
+  </div>
+
+  <div class="footer">trojan-worker · ECH on · ${backupIPs.length} relay pool</div>
+</div>
+<script>
+function copy(id, btn) {
+  const text = document.getElementById(id).textContent.trim();
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = 'COPIED';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1800);
+  });
+}
+</script>
+</body>
+</html>`.replace('${sorted_count}', String(backupIPs.length + 1));
+}
+
+//-----------------------------------------------------------------------------
 //-----------------------------------------------------------------------------
 /**
  * Builds a Trojan WebSocket link string. When ECH is enabled, adds
