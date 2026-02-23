@@ -1313,279 +1313,7 @@
         return btoa(links.join('\n'));
     }
 
-    // ── Shadowsocks helpers (Worker.js style) ──────────────────────────────
-
-    /** Normalise plugin name to canonical form */
-    function normaliseSsPlugin(rawPlugin) {
-        if (!rawPlugin) return null;
-        const p = rawPlugin.toLowerCase().trim();
-        if (p === 'v2ray-plugin' || p === 'xray-plugin') return 'v2ray-plugin';
-        if (p === 'obfs-local' || p === 'simple-obfs' || p === 'obfs') return 'obfs-local';
-        if (p === 'shadow-tls') return 'shadow-tls';
-        return rawPlugin;
-    }
-
-    /**
-     * Parse a ss:// URI into its components.
-     * Supports:
-     *   - base64(method:pass)@host:port[?plugin=...][?type=ws&host=...&path=...&security=tls&sni=...]
-     *   - base64(method:pass@host:port) (legacy fully-encoded form)
-     */
-    function parseShadowsocksUrl(url) {
-        try {
-            let workingUrl = url;
-
-            // Extract fragment (name)
-            let name = 'ss-node';
-            const hashIndex = workingUrl.indexOf('#');
-            if (hashIndex !== -1) {
-                try { name = decodeURIComponent(workingUrl.substring(hashIndex + 1)); }
-                catch (e) { name = workingUrl.substring(hashIndex + 1); }
-                workingUrl = workingUrl.substring(0, hashIndex);
-            }
-
-            workingUrl = workingUrl.replace(/^ss:\/\//, '');
-
-            let method, password, server, port;
-            let plugin = null;
-            let pluginOpts = {};
-            let rawPluginOpts = '';
-            let transportType = 'tcp';
-
-            // Extract query parameters
-            const queryIndex = workingUrl.indexOf('?');
-            if (queryIndex !== -1) {
-                const queryString = workingUrl.substring(queryIndex + 1);
-                workingUrl = workingUrl.substring(0, queryIndex);
-                const params = new URLSearchParams(queryString);
-
-                let pluginParam = params.get('plugin');
-                if (pluginParam) {
-                    try { pluginParam = decodeURIComponent(pluginParam); } catch (e) {}
-                    const pluginParts = pluginParam.split(';');
-                    plugin = pluginParts[0];
-                    if (pluginParts.length > 1) {
-                        rawPluginOpts = pluginParts.slice(1).join(';');
-                        for (let i = 1; i < pluginParts.length; i++) {
-                            const part = pluginParts[i].trim();
-                            if (!part) continue;
-                            const eqIdx = part.indexOf('=');
-                            if (eqIdx !== -1) {
-                                pluginOpts[part.substring(0, eqIdx).trim()] = part.substring(eqIdx + 1).trim();
-                            } else {
-                                pluginOpts[part] = true;
-                            }
-                        }
-                    }
-                    if (pluginOpts.mode === 'websocket' || pluginOpts.mode === 'ws') transportType = 'ws';
-                    else if (pluginOpts.mode === 'grpc') transportType = 'grpc';
-                }
-
-                // Standalone native WS/TLS params (no plugin)
-                if (!plugin) {
-                    if (params.get('type'))        transportType = params.get('type');
-                    if (params.get('path')) {
-                        pluginOpts.path = params.get('path');
-                        if (transportType === 'tcp') transportType = 'ws';
-                    }
-                    if (params.get('host'))        pluginOpts.host = params.get('host');
-                    if (params.get('sni'))         pluginOpts.sni  = params.get('sni');
-                    if (params.get('serviceName') || params.get('sn')) {
-                        pluginOpts.serviceName = params.get('serviceName') || params.get('sn');
-                        transportType = 'grpc';
-                    }
-                    if (params.get('security') === 'tls' || params.get('tls') === 'true') {
-                        pluginOpts.tls = true;
-                    }
-                }
-            }
-
-            // Parse user@host:port
-            const atIndex = workingUrl.lastIndexOf('@');
-            if (atIndex !== -1) {
-                const userInfo = workingUrl.substring(0, atIndex);
-                const serverPart = workingUrl.substring(atIndex + 1);
-
-                let decodedUserInfo;
-                try {
-                    decodedUserInfo = atob(userInfo.replace(/-/g, '+').replace(/_/g, '/'));
-                    if (!decodedUserInfo.includes(':')) decodedUserInfo = userInfo;
-                } catch (e) { decodedUserInfo = userInfo; }
-
-                const colonIdx = decodedUserInfo.indexOf(':');
-                if (colonIdx === -1) return null;
-                method   = decodedUserInfo.substring(0, colonIdx);
-                password = decodedUserInfo.substring(colonIdx + 1);
-
-                if (serverPart.startsWith('[')) {
-                    const cb = serverPart.indexOf(']');
-                    if (cb === -1) return null;
-                    server = serverPart.substring(1, cb);
-                    port   = parseInt(serverPart.substring(cb + 2), 10);
-                } else {
-                    const lc = serverPart.lastIndexOf(':');
-                    if (lc === -1) return null;
-                    server = serverPart.substring(0, lc);
-                    port   = parseInt(serverPart.substring(lc + 1), 10);
-                }
-            } else {
-                // Fully base64-encoded legacy format
-                let decoded;
-                try { decoded = atob(workingUrl.replace(/-/g, '+').replace(/_/g, '/')); }
-                catch (e) { return null; }
-                const atIdx = decoded.lastIndexOf('@');
-                if (atIdx === -1) return null;
-                const userPart   = decoded.substring(0, atIdx);
-                const serverPart = decoded.substring(atIdx + 1);
-                const colonIdx   = userPart.indexOf(':');
-                if (colonIdx === -1) return null;
-                method   = userPart.substring(0, colonIdx);
-                password = userPart.substring(colonIdx + 1);
-                const lc = serverPart.lastIndexOf(':');
-                if (lc === -1) return null;
-                server = serverPart.substring(0, lc);
-                port   = parseInt(serverPart.substring(lc + 1), 10);
-            }
-
-            if (!server || !method || isNaN(port) || port <= 0 || port > 65535) return null;
-
-            return { server, port, method, password, name, plugin, pluginOpts, rawPluginOpts, transportType };
-        } catch (e) {
-            return null;
-        }
-    }
-
-    /**
-     * Convert an ss:// link to a Clash proxy object.
-     * Supports native WS transport (network: ws / ws-opts) AND v2ray-plugin,
-     * matching Worker.js behaviour.
-     */
-    function parseSsLinkToClashNode(link) {
-        try {
-            const parsed = parseShadowsocksUrl(link);
-            if (!parsed) return null;
-
-            const { server, port, method, password, name, plugin: rawPlugin,
-                    pluginOpts, transportType } = parsed;
-
-            const canonicalMethod = SS_CIPHERS[method.toLowerCase()] || method;
-            const isNoEncryption  = (canonicalMethod === 'none');
-            const plugin          = normaliseSsPlugin(rawPlugin);
-
-            const proxy = {
-                name:   name || 'ss-node',
-                type:   'ss',
-                server: server,
-                port:   port,
-                cipher: canonicalMethod,
-                password: isNoEncryption ? '' : password,
-                udp:   true,
-            };
-
-            // ── Native WebSocket transport (no plugin needed) ──────────────
-            // This is what Index.js generates and what works natively in
-            // Clash Meta without any external binary.
-            if (!plugin && (transportType === 'ws' || pluginOpts.path)) {
-                proxy.network = 'ws';
-                proxy['ws-opts'] = { path: pluginOpts.path || '/' };
-                if (pluginOpts.host) {
-                    proxy['ws-opts'].headers = { Host: pluginOpts.host };
-                }
-                if (pluginOpts.tls === true || pluginOpts.tls === 'true') {
-                    proxy.tls = true;
-                    proxy.sni = pluginOpts.sni || pluginOpts.host || server;
-                    proxy['skip-cert-verify'] = false;
-                }
-                proxy['udp-over-tcp'] = false;
-                return proxy;
-            }
-
-            // ── v2ray-plugin (built-in in Clash Meta) ─────────────────────
-            if (plugin === 'v2ray-plugin') {
-                proxy['udp-over-tcp'] = false;
-                proxy.plugin = 'v2ray-plugin';
-                const mode = pluginOpts.mode || 'websocket';
-                proxy['plugin-opts'] = { mode };
-                if (pluginOpts.host) proxy['plugin-opts'].host = pluginOpts.host;
-                if (pluginOpts.path) proxy['plugin-opts'].path = pluginOpts.path;
-                if (pluginOpts.tls === true || pluginOpts.tls === 'true' || pluginOpts.tls === '1') {
-                    proxy['plugin-opts'].tls = true;
-                    proxy['plugin-opts']['skip-cert-verify'] = false; // enforce TLS verification
-                }
-                if (pluginOpts.sni) proxy['plugin-opts'].sni = pluginOpts.sni;
-                if (pluginOpts.mux !== undefined) {
-                    proxy['plugin-opts'].mux = !(pluginOpts.mux === '0' || pluginOpts.mux === false);
-                }
-                return proxy;
-            }
-
-            // ── obfs-local ────────────────────────────────────────────────
-            if (plugin === 'obfs-local') {
-                proxy['udp-over-tcp'] = false;
-                proxy.plugin = 'obfs';
-                proxy['plugin-opts'] = { mode: pluginOpts.obfs || pluginOpts.mode || 'http' };
-                const obfsHost = pluginOpts['obfs-host'] || pluginOpts.host;
-                if (obfsHost) proxy['plugin-opts'].host = obfsHost;
-                return proxy;
-            }
-
-            // ── Unknown or no plugin — plain TCP ─────────────────────────
-            proxy['udp-over-tcp'] = !plugin;
-            if (plugin) proxy.plugin = plugin;
-            return proxy;
-
-        } catch (e) {
-            return null;
-        }
-    }
-
-    /**
-     * Generate a Shadowsocks subscription (base64 plain-text ss:// list).
-     * Filters to ss:// links and re-encodes with canonical cipher names.
-     */
-    function generateSSConfig(links) {
-        const ssLinks = links.filter(l => l && l.trim().startsWith('ss://'));
-        const source  = ssLinks.length > 0 ? ssLinks : links;
-        const canonical = source.map(link => {
-            if (!link.startsWith('ss://')) return link;
-            try {
-                const parsed = parseShadowsocksUrl(link);
-                if (!parsed) return link;
-                const { server, port, method, password, name, plugin,
-                        pluginOpts, rawPluginOpts, transportType } = parsed;
-                const canonicalMethod = SS_CIPHERS[method.toLowerCase()] || method;
-                const isNoEncryption  = (canonicalMethod === 'none');
-                const userInfo = safeBase64Encode(`${canonicalMethod}:${isNoEncryption ? '' : password}`);
-
-                let uri = `ss://${userInfo}@${server}:${port}`;
-
-                const normPlugin = normaliseSsPlugin(plugin);
-                if (normPlugin) {
-                    // Plugin-based link: rebuild plugin string (strip skip-cert-verify)
-                    let optsStr = rawPluginOpts
-                        ? rawPluginOpts.replace(/;?skip-cert-verify=[^;]*/gi, '').replace(/;;+/g, ';').replace(/^;|;$/g, '')
-                        : Object.entries(pluginOpts).map(([k, v]) => v === true ? k : `${k}=${v}`).join(';');
-                    uri += `?plugin=${encodeURIComponent(normPlugin + (optsStr ? ';' + optsStr : ''))}`;
-                } else if (transportType === 'ws' || pluginOpts.path) {
-                    // Native WS transport — keep as standalone params
-                    const p = new URLSearchParams({ type: 'ws' });
-                    if (pluginOpts.host) p.set('host', pluginOpts.host);
-                    if (pluginOpts.path) p.set('path', pluginOpts.path);
-                    if (pluginOpts.tls)  { p.set('security', 'tls'); }
-                    if (pluginOpts.sni)  p.set('sni', pluginOpts.sni);
-                    uri += `?${p.toString()}`;
-                }
-
-                if (name) uri += `#${encodeURIComponent(name)}`;
-                return uri;
-            } catch (e) {
-                return link;
-            }
-        });
-        return btoa(unescape(encodeURIComponent(canonical.join('\n'))));
-    }
-
-    // ── End Shadowsocks helpers ────────────────────────────────────────────
+    // 解析 VLESS/Trojan 链接并生成 Clash 节点配置
     function parseLinkToClashNode(link) {
         try {
             // 解析 VLESS 链接
@@ -1689,11 +1417,6 @@
                 }
                 
                 return node;
-            }
-
-            // 解析 Shadowsocks 链接 (native WS transport — Worker.js style)
-            if (link.startsWith('ss://')) {
-                return parseSsLinkToClashNode(link);
             }
         } catch (e) {
             return null;
@@ -2312,21 +2035,13 @@
             let nodeName = item.isp || item.name || item.colo || host;
 
             const encodedUserInfo = safeBase64Encode(`${ssMethod}:${password}`);
-            // Use native WS transport params instead of v2ray-plugin.
-            // v2ray-plugin requires an external binary that mobile/embedded
-            // Sing-box and most clients do not have — causing timeouts.
-            // Native WS params work directly in Clash Meta and are correctly
-            // converted by Worker.js to native transport (no plugin needed).
-            const wsPath = `/${password}`;
-            const params = new URLSearchParams({
-                type:     'ws',
-                host:     workerDomain,
-                path:     wsPath,
-                security: 'tls',
-                sni:      workerDomain,
-            });
+            // Path: /{UUID}/?ed=2560  — UUID prefix lets handleWsRequest
+            // identify SS connections before running VLESS/Trojan parsers.
+            // ed=2560 enables early-data for lower latency (no skip-cert-verify).
+            const wsPath = `/${password}/?ed=2560`;
+            const pluginString = `v2ray-plugin;mode=websocket;host=${workerDomain};path=${wsPath};tls;sni=${workerDomain};alpn=http/1.1;mux=0`;
 
-            links.push(`ss://${encodedUserInfo}@${host}:${port}?${params.toString()}#${encodeURIComponent(nodeName)}`);
+            links.push(`ss://${encodedUserInfo}@${host}:${port}?plugin=${encodeURIComponent(pluginString)}#${encodeURIComponent(nodeName)}`);
         });
         return links;
     }
@@ -2429,7 +2144,17 @@
 
         let remoteConnWrapper = { socket: null };
         let isDnsQuery = false;
-        let protocolType = null; 
+        let protocolType = null;
+
+        // Detect SS connection by path: /{UUID}/...  or  /ss/{UUID}/...
+        // This lets us skip expensive VLESS/Trojan parsing for known SS connections.
+        const requestUrl = new URL(request.url);
+        const requestPath = requestUrl.pathname;
+        const isSsPath = es && (
+            requestPath.startsWith('/' + at + '/') ||
+            requestPath === '/' + at ||
+            requestPath.startsWith('/ss/' + at)
+        );
 
         const earlyData = request.headers.get(atob('c2VjLXdlYnNvY2tldC1wcm90b2NvbA==')) || '';
         const readable = makeReadableStream(serverSock, earlyData);
@@ -2446,6 +2171,22 @@
                 
                 if (!protocolType) {
                     
+                    // If path identifies this as SS, try SS first (skip VLESS/Trojan overhead)
+                    if (isSsPath && chunk.byteLength >= 4) {
+                        const ssResult = parseSSPacketHeader(chunk);
+                        if (!ssResult.hasError) {
+                            protocolType = 'shadowsocks';
+                            const { addressType, port, hostname, rawIndex } = ssResult;
+                            const rawData = chunk.slice(rawIndex);
+                            if (port === 53) { isDnsQuery = true; return forwardUDP(rawData, serverSock, null); }
+                            await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper, true);
+                            return;
+                        }
+                        // SS path but header parse failed — close cleanly
+                        closeSocketQuietly(serverSock);
+                        return;
+                    }
+
                     if (ev && chunk.byteLength >= 24) {
                         const vlessResult = parseWsPacketHeader(chunk, at);
                         if (!vlessResult.hasError) {
@@ -2473,22 +2214,20 @@
                         }
                     }
                     
-                    // Try Shadowsocks (min 4 bytes: 1 addrtype + 4 IPv4 or 1+1 domain-len + port)
+                    // Try Shadowsocks fallback (min 4 bytes: addrtype + min addr + port)
                     if (es && chunk.byteLength >= 4) {
                         const ssResult = parseSSPacketHeader(chunk);
                         if (!ssResult.hasError) {
                             protocolType = 'shadowsocks';
                             const { addressType, port, hostname, rawIndex } = ssResult;
-                            
                             const rawData = chunk.slice(rawIndex);
-                            if (isDnsQuery) return forwardUDP(rawData, serverSock, null);
-                            
+                            if (port === 53) { isDnsQuery = true; return forwardUDP(rawData, serverSock, null); }
                             await forwardTCP(addressType, hostname, port, rawData, serverSock, null, remoteConnWrapper, true);
                             return;
                         }
                     }
                     
-                    // No protocol matched — close cleanly instead of leaving connection hanging
+                    // No protocol matched — close cleanly, do NOT leave dangling
                     closeSocketQuietly(serverSock);
                     return;
                 }
