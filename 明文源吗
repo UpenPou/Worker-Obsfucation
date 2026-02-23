@@ -9,292 +9,57 @@ import { connect } from "cloudflare:sockets";
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-// Environment variables — defaults only; actual values are local per-request.
-// These are kept as module-level vars for functions that read them
-// (buildTrojanLink, isValidPassword, etc.). The fetch handler always
-// writes them before any request logic runs.
-let password = "";
+// Environment variables.
+let password = ""; // MUST be provided explicitly from Environment
 let sha224Password;
-let proxyIP = "";
-let keepaliveMs = 0;
-let enableECH = true;
-let customDNS = 'https://cloudflare-dns.com/dns-query';
-let customECHDomain = 'cloudflare-ech.com';
 
-// Global variable to store ECH debug info
-let echDebugInfo = '';
+// Connection parameter.
+let proxyIP = ""; // MUST be provided explicitly from Environment
 
-// Subscription converter URL (can be overridden via KV key 'SCU')
-let scu = 'https://url.v1.mk/sub';
-// Remote Clash rule config URL
-const remoteConfigUrl = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
-
-//-----------------------------------------------------------------------------
-// Backup ProxyIP pool — nearest server selected automatically per request
-// These are the same CMLiussss relay domains used by Index.js.
-// When no PROXYIP env var / KV override is set, the worker picks the closest
-// one based on the Cloudflare data-centre country that handled the request.
-//-----------------------------------------------------------------------------
-const backupIPs = [
-  { domain: 'ProxyIP.US.CMLiussss.net',           regionCode: 'US',           port: 443 },
-  { domain: 'ProxyIP.SG.CMLiussss.net',           regionCode: 'SG',           port: 443 },
-  { domain: 'ProxyIP.JP.CMLiussss.net',           regionCode: 'JP',           port: 443 },
-  { domain: 'ProxyIP.KR.CMLiussss.net',           regionCode: 'KR',           port: 443 },
-  { domain: 'ProxyIP.DE.CMLiussss.net',           regionCode: 'DE',           port: 443 },
-  { domain: 'ProxyIP.SE.CMLiussss.net',           regionCode: 'SE',           port: 443 },
-  { domain: 'ProxyIP.NL.CMLiussss.net',           regionCode: 'NL',           port: 443 },
-  { domain: 'ProxyIP.FI.CMLiussss.net',           regionCode: 'FI',           port: 443 },
-  { domain: 'ProxyIP.GB.CMLiussss.net',           regionCode: 'GB',           port: 443 },
-  { domain: 'ProxyIP.Oracle.cmliussss.net',       regionCode: 'Oracle',       port: 443 },
-  { domain: 'ProxyIP.DigitalOcean.CMLiussss.net', regionCode: 'DigitalOcean', port: 443 },
-  { domain: 'ProxyIP.Vultr.CMLiussss.net',        regionCode: 'Vultr',        port: 443 },
-  { domain: 'ProxyIP.Multacom.CMLiussss.net',     regionCode: 'Multacom',     port: 443 },
-];
-
-// Cached for the lifetime of the isolate so region detection only runs once
-// per cold-start, not on every request.
-let currentWorkerRegion = '';
-
-/**
- * Derive the Cloudflare data-centre region from request.cf.country.
- * Falls back to 'SG' (geographically central) if undetermined.
- * Identical mapping to Index.js detectWorkerRegion().
- */
-function detectWorkerRegion(request) {
-  try {
-    const country = request.cf?.country;
-    if (country) {
-      const map = {
-        'US': 'US', 'CA': 'US',
-        'SG': 'SG', 'AU': 'SG', 'CN': 'SG',
-        'JP': 'JP', 'TW': 'JP',
-        'KR': 'KR',
-        'DE': 'DE', 'FR': 'DE', 'IT': 'DE', 'ES': 'DE', 'CH': 'DE', 'AT': 'DE',
-        'NL': 'NL', 'BE': 'NL',
-        'SE': 'SE', 'DK': 'SE', 'NO': 'SE',
-        'FI': 'FI',
-        'GB': 'GB', 'IE': 'GB',
-      };
-      if (map[country]) return map[country];
-    }
-  } catch (_) {}
-  return 'SG';
-}
-
-/**
- * Regions geographically adjacent to each primary region.
- * Used to build a priority order: exact match → nearby → everything else.
- */
-function getNearbyRegions(region) {
-  const nearby = {
-    'US': ['SG', 'JP', 'KR'],
-    'SG': ['JP', 'KR', 'US'],
-    'JP': ['SG', 'KR', 'US'],
-    'KR': ['JP', 'SG', 'US'],
-    'DE': ['NL', 'GB', 'SE', 'FI'],
-    'SE': ['DE', 'NL', 'FI', 'GB'],
-    'NL': ['DE', 'GB', 'SE', 'FI'],
-    'FI': ['SE', 'DE', 'NL', 'GB'],
-    'GB': ['DE', 'NL', 'SE', 'FI'],
-  };
-  return nearby[region] || [];
-}
-
-/**
- * Full ordered region list: exact match first, then nearby, then the rest.
- */
-function getAllRegionsByPriority(region) {
-  const nearby = getNearbyRegions(region);
-  const all = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
-  return [region, ...nearby, ...all.filter(r => r !== region && !nearby.includes(r))];
-}
-
-/**
- * Sort backupIPs by proximity to workerRegion.
- * Provider-only entries (Oracle, DigitalOcean, Vultr, Multacom) are appended
- * last since they have no geographic regionCode to match against.
- */
-function getSortedBackupIPs(workerRegion) {
-  if (!workerRegion) return [...backupIPs];
-  const priority = getAllRegionsByPriority(workerRegion);
-  const geoIPs      = backupIPs.filter(ip => priority.includes(ip.regionCode));
-  const providerIPs = backupIPs.filter(ip => !priority.includes(ip.regionCode));
-  // Sort geo IPs by their position in the priority list
-  geoIPs.sort((a, b) => priority.indexOf(a.regionCode) - priority.indexOf(b.regionCode));
-  return [...geoIPs, ...providerIPs];
-}
-
-/**
- * Return the single best backup ProxyIP for the given worker region.
- * Returns { domain, port } or null if the pool is empty (shouldn't happen).
- */
-function getBestBackupIP(workerRegion) {
-  const sorted = getSortedBackupIPs(workerRegion);
-  return sorted.length > 0 ? sorted[0] : null;
-}
-
-//-----------------------------------------------------------------------------
-// KV Store — runtime config that overrides env vars without redeployment
-// Bind a KV namespace to env.KV in wrangler.toml.
-// Stores a single JSON blob under key 'c' with the following relevant fields:
-//   PROXYIP    — proxyIP override  (host:port)
-//   ECH        — ECH enabled flag  ('yes' | 'no')  [default: yes]
-//   DOH        — DNS-over-HTTPS URL
-//   ECH_DOMAIN — ECH domain for HTTPS record queries
-//   KEEPALIVE  — keepalive interval in ms
-//   PASSWORD   — password/token override
-//   DKBY       — auto-set to 'yes' when ECH is enabled
-//-----------------------------------------------------------------------------
-let kvStore = null;
-let kvConfig = {};
-
-//-----------------------------------------------------------------------------
-// KV Helpers
-//-----------------------------------------------------------------------------
-
-/**
- * Initialise the KV store from env.KV.
- * Silently no-ops if not bound — env vars remain the source of truth.
- */
-async function initKVStore(env) {
-  const ns = env.KV || null;
-  if (!ns) { kvStore = null; kvConfig = {}; return; }
-  try {
-    kvStore = ns;
-    await loadKVConfig();
-  } catch (err) {
-    console.warn("KV init failed (continuing without KV):", err.message);
-    kvStore = null;
-    kvConfig = {};
-  }
-}
-
-/** Load the single config blob from KV. Safe to call multiple times. */
-async function loadKVConfig() {
-  if (!kvStore) return;
-  try {
-    const raw = await kvStore.get('c');
-    kvConfig = raw ? JSON.parse(raw) : {};
-  } catch (err) {
-    console.warn("KV load failed:", err.message);
-    kvConfig = {};
-  }
-}
-
-/** Persist the in-memory kvConfig blob back to KV. */
-async function saveKVConfig() {
-  if (!kvStore) throw new Error("KV not available");
-  await kvStore.put('c', JSON.stringify(kvConfig));
-}
-
-/**
- * Read a config value.
- * Priority: KV > envValue > defaultValue
- * @param {string}  key          - KV key name
- * @param {string}  [envValue]   - Fallback from env var
- * @param {string}  [defaultVal] - Final fallback
- */
-function getKV(key, envValue = '', defaultVal = '') {
-  if (kvConfig[key] !== undefined && kvConfig[key] !== null) return kvConfig[key];
-  if (envValue !== undefined && envValue !== null && envValue !== '') return envValue;
-  return defaultVal;
-}
-
-/**
- * Write a single value to KV (also persists the full blob).
- * Silently no-ops if KV is not bound.
- */
-async function setKV(key, value) {
-  kvConfig[key] = value;
-  try { await saveKVConfig(); } catch (err) {
-    console.warn(`KV write failed for key "${key}":`, err.message);
-  }
-}
+// Keepalive parameter.
+let keepaliveMs = 0; // optional, read from env
 
 //-----------------------------------------------------------------------------
 // Main Worker Fetch Handler
 //-----------------------------------------------------------------------------
-/**
- * The default Worker handler.
- */
 export default {
   async fetch(request, env, ctx) {
     try {
-      // 1. Init KV first — it overrides env vars for all config below
-      await initKVStore(env);
-
-      // 2. Password — KV key 'PASSWORD' can override the env PASSWORD at runtime
-      password = getKV('PASSWORD', env.PASSWORD || env.pswd || env.UUID || env.uuid || env.TOKEN);
+      // Init globals once per invocation
+      password = env.PASSWORD || env.pswd || env.UUID || env.uuid || env.TOKEN;
       if (!password) {
         throw new Error("Missing required PASSWORD/UUID/TOKEN environment variable.");
       }
 
       sha224Password = env.SHA224 || env.SHA224PASS || sha224(password);
-      
-      // 3. Keepalive — KV key 'KEEPALIVE' overrides KEEPALIVE_MS
-      keepaliveMs = Number(getKV('KEEPALIVE', env.KEEPALIVE_MS, 0)) || 0;
+      keepaliveMs = Number(env.KEEPALIVE_MS) || 0;
+      proxyIP = env.PROXYIP || env.proxyip || "";
 
-      // 4. ProxyIP — KV key 'PROXYIP' overrides PROXYIP env var.
-      // If neither is set, automatically pick the nearest backupIP from the pool.
-      proxyIP = getKV('PROXYIP', env.PROXYIP || env.proxyip || "");
-
-      // Detect (and cache) the worker region once per isolate lifetime
-      if (!currentWorkerRegion) {
-        currentWorkerRegion = detectWorkerRegion(request);
-      }
-
-      // Auto-select nearest backupIP when no explicit PROXYIP is configured
-      if (!proxyIP) {
-        const best = getBestBackupIP(currentWorkerRegion);
-        if (best) {
-          proxyIP = `${best.domain}:${best.port}`;
-          console.log(`[ProxyIP] No PROXYIP set — auto-selected nearest: ${proxyIP} (region: ${currentWorkerRegion})`);
-        }
-      }
-
-      // 5. ECH — KV key 'ECH' overrides env; default is ON (true)
-      const echVal = getKV('ECH', env.ECH || env.ech, 'yes');
-      enableECH = echVal !== 'no' && echVal !== 'false' && echVal !== '0';
-
-      // 6. DOH and ECH_DOMAIN — KV keys override env vars
-      customDNS = getKV('DOH', env.DOH || env.CUSTOM_DNS || env.customDNS, 'https://cloudflare-dns.com/dns-query');
-      customECHDomain = getKV('ECH_DOMAIN', env.ECH_DOMAIN || env.CUSTOM_ECH_DOMAIN || env.customECHDomain, 'cloudflare-ech.com');
-
-      // 7. If ECH is enabled, auto-persist DKBY=yes to KV
-      if (enableECH && getKV('DKBY', '', '') !== 'yes') {
-        await setKV('DKBY', 'yes');
-      }
-
-      // 8. Validate PROXYIP — warn and clear instead of hard-crashing the worker
       if (proxyIP && !/^(?:[a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\]):\d+$/.test(proxyIP)) {
-        console.warn(`Invalid PROXYIP format: "${proxyIP}". Clearing — will retry direct on failure.`);
+        console.warn(`Invalid PROXYIP format: "${proxyIP}" — clearing.`);
         proxyIP = "";
       }
 
       const reqUrl = new URL(request.url);
 
-      // Serve homepage if root path.
+      // Homepage
       if (reqUrl.pathname === "/") {
         return serveHomepage(env);
       }
 
-      // Trojan configuration page: /<password>
-      // Returns a styled HTML page showing the trojan link, V2Ray sub link, and Clash sub link.
+      // Config page: /<password>
+      // Returns styled HTML with trojan link + V2Ray sub link + Clash sub link
       if (reqUrl.pathname === `/${password}`) {
         const hostName = request.headers.get("Host") || "example.com";
         return new Response(serveConfigPage(password, hostName), {
           status: 200,
-          headers: {
-            "Content-Type": "text/html;charset=utf-8",
-            "X-ECH-Status": "ENABLED",
-          },
+          headers: { "Content-Type": "text/html;charset=utf-8" },
         });
       }
 
-      // Subscription endpoint: /<password>/sub
-      // ?target=clash  → Clash YAML via converter
-      // ?target=base64 → raw base64 (used internally by clash converter)
-      // default        → base64 nodes (V2Ray / universal)
+      // Subscription: /<password>/sub
+      // default → base64 nodes (V2Ray/universal import)
+      // ?target=clash → Clash YAML
       if (reqUrl.pathname === `/${password}/sub`) {
         const hostName = request.headers.get("Host") || "example.com";
         const target = (reqUrl.searchParams.get("target") || "").toLowerCase();
@@ -306,11 +71,7 @@ export default {
             const clashYaml = await generateClashConfig(nodes, request, password, hostName);
             return new Response(clashYaml, {
               status: 200,
-              headers: {
-                "Content-Type": "text/yaml;charset=utf-8",
-                "Cache-Control": "no-store",
-                "X-ECH-Status": "ENABLED",
-              },
+              headers: { "Content-Type": "text/yaml;charset=utf-8", "Cache-Control": "no-store" },
             });
           } catch (err) {
             return new Response(`# Clash config generation failed: ${err.message}`, {
@@ -322,105 +83,32 @@ export default {
 
         return new Response(base64Content, {
           status: 200,
-          headers: {
-            "Content-Type": "text/plain;charset=utf-8",
-            "Cache-Control": "no-store",
-            "X-ECH-Status": "ENABLED",
-          },
+          headers: { "Content-Type": "text/plain;charset=utf-8", "Cache-Control": "no-store" },
         });
       }
 
-      // ECH status/debug endpoint: /<password>/ech-status
-      if (reqUrl.pathname === `/${password}/ech-status`) {
-        const statusInfo = {
-          echEnabled: true,
-          customDNS,
-          customECHDomain,
-          debugInfo: echDebugInfo || 'ECH enabled',
-        };
-        return new Response(JSON.stringify(statusInfo, null, 2), {
-          status: 200,
-          headers: { "Content-Type": "application/json;charset=utf-8" },
-        });
-      }
-
-      // KV config API: /<password>/config
-      // GET  → returns current effective config (KV values shown, env defaults where KV is absent)
-      // POST → accepts JSON body with any subset of: { p, ech, customDNS, customECHDomain, keepalive, tp }
-      //        Writes to KV; takes effect on next request without redeployment.
-      //        Send a key with value "" or null to delete it from KV (env var fallback resumes).
-      if (reqUrl.pathname === `/${password}/config`) {
-        if (!kvStore) {
-          return new Response(JSON.stringify({
-            error: "KV not configured. Bind a KV namespace to the 'KV' (or 'C') variable in wrangler.toml.",
-            kvEnabled: false,
-          }), { status: 503, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (request.method === "GET") {
-          return new Response(JSON.stringify({
-            kvEnabled: true,
-            config: {
-              PROXYIP:    { value: proxyIP,                       source: kvConfig.PROXYIP    !== undefined ? "kv" : (env.PROXYIP ? "env" : "auto-backupIP") },
-              ECH:        { value: enableECH ? 'yes' : 'no',      source: kvConfig.ECH        !== undefined ? "kv" : "env" },
-              DOH:        { value: customDNS,                     source: kvConfig.DOH        !== undefined ? "kv" : "env" },
-              ECH_DOMAIN: { value: customECHDomain,               source: kvConfig.ECH_DOMAIN !== undefined ? "kv" : "env" },
-              KEEPALIVE:  { value: keepaliveMs,                   source: kvConfig.KEEPALIVE  !== undefined ? "kv" : "env" },
-              PASSWORD:   { value: "[hidden]",                    source: kvConfig.PASSWORD   !== undefined ? "kv" : "env" },
-              DKBY:       { value: kvConfig.DKBY || 'not set',    source: kvConfig.DKBY       !== undefined ? "kv" : "env" },
-            },
-            workerRegion: currentWorkerRegion,
-            backupIPPool: getSortedBackupIPs(currentWorkerRegion).map(b => `${b.domain}:${b.port}`),
-            rawKV: { ...kvConfig, PASSWORD: kvConfig.PASSWORD ? "[hidden]" : undefined },
-          }, null, 2), { status: 200, headers: { "Content-Type": "application/json" } });
-        }
-
-        if (request.method === "POST") {
-          try {
-            const updates = await request.json();
-            const allowed = new Set(['PROXYIP', 'ECH', 'DOH', 'ECH_DOMAIN', 'KEEPALIVE', 'PASSWORD', 'DKBY']);
-            for (const [key, value] of Object.entries(updates)) {
-              if (!allowed.has(key)) continue; // silently ignore unknown keys
-              if (value === "" || value === null || value === undefined) {
-                delete kvConfig[key];
-              } else {
-                kvConfig[key] = value;
-              }
-            }
-            await saveKVConfig();
-            return new Response(JSON.stringify({
-              success: true,
-              message: "Config saved. Takes effect on next request.",
-              savedKeys: Object.keys(updates).filter(k => allowed.has(k)),
-            }), { status: 200, headers: { "Content-Type": "application/json" } });
-          } catch (err) {
-            return new Response(JSON.stringify({ success: false, error: err.message }),
-              { status: 400, headers: { "Content-Type": "application/json" } });
-          }
-        }
-
-        return new Response(JSON.stringify({ error: "Method not allowed" }),
-          { status: 405, headers: { "Content-Type": "application/json" } });
-      }
-
-      // Validate WebSocket upgrade.
+      // WebSocket upgrade validation
       const upgradeHeader = request.headers.get("Upgrade");
-      const websocketKey = request.headers.get("sec-websocket-key");
+      const websocketKey  = request.headers.get("sec-websocket-key");
+      const allowedProtocols = ["ws", "wss", "voip"];
+      const subprotocol = request.headers.get("sec-websocket-protocol") || "";
+
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket" || !websocketKey) {
         return new Response(
-          "This node is for WebSocket connections only. Use '/<your-password>' for Trojan configuration.",
+          "WebSocket connections only. Visit /<your-password> for config.",
           { status: 400, headers: { "Content-Type": "text/plain;charset=utf-8" } }
         );
       }
 
-      // NOTE: Do NOT reject unknown subprotocols — clients using path=/?ed=2048
-      // send early data as a base64 string in sec-websocket-protocol.
-      // Cloudflare Workers echo it back automatically via webSocket.accept().
+      if (subprotocol && !allowedProtocols.includes(subprotocol.toLowerCase())) {
+        return new Response("Unsupported WebSocket subprotocol.", { status: 400 });
+      }
 
-      // Initiate Trojan-over-WebSocket handling.
+      // Handle Trojan-over-WebSocket
       const trojanPromise = handleTrojanOverWS(request);
       ctx.waitUntil(trojanPromise);
       return await trojanPromise;
+
     } catch (err) {
       console.error("Global fetch error:", err);
       return new Response(err.toString(), { status: 500 });
@@ -431,16 +119,10 @@ export default {
 //-----------------------------------------------------------------------------
 // Handle Trojan-over-WebSocket Connections
 //-----------------------------------------------------------------------------
-/**
- * Handles Trojan-over-WebSocket connections.
- *
- * @param {Request} request - The WebSocket upgrade request.
- * @returns {Promise<Response>} A promise resolving to a WebSocket upgrade response.
- */
 async function handleTrojanOverWS(request) {
   const webSocketPair = new WebSocketPair();
   const [client, webSocket] = Object.values(webSocketPair);
-  
+
   try {
     webSocket.accept();
     webSocket.binaryType = "arraybuffer";
@@ -451,34 +133,26 @@ async function handleTrojanOverWS(request) {
 
   let address = "";
   let portWithRandomLog = "";
-  
-  // Pre-computed random value to avoid repeated Math.random() calls
   const logId = Math.random().toFixed(4);
-  
+
   const log = (info, event) => {
     console.log(`[${new Date().toISOString()}] [${address}:${portWithRandomLog}] ${info}`, event || "");
   };
 
-  // Optimized keepalive with proper cleanup tracking
   let keepaliveTimer = null;
   let isActive = true;
-  
+
   const startKeepalive = () => {
     if (Number.isFinite(keepaliveMs) && keepaliveMs > 0 && isActive) {
       keepaliveTimer = setInterval(() => {
-        if (!isActive) {
-          clearInterval(keepaliveTimer);
-          return;
-        }
-        
+        if (!isActive) { clearInterval(keepaliveTimer); return; }
         try {
-          if (webSocket?.readyState === 1 /* WebSocket OPEN */) {
+          if (webSocket?.readyState === 1) {
             webSocket.send("~keepalive~");
           } else {
             clearInterval(keepaliveTimer);
             keepaliveTimer = null;
           }
-          
         } catch (e) {
           console.error("Keepalive send error:", e);
           clearInterval(keepaliveTimer);
@@ -490,82 +164,40 @@ async function handleTrojanOverWS(request) {
 
   const stopKeepalive = () => {
     isActive = false;
-    if (keepaliveTimer) {
-      clearInterval(keepaliveTimer);
-      keepaliveTimer = null;
-    }
+    if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
   };
 
-  // Consolidated event handlers with optimized cleanup
-  const handleClose = (evt) => {
+  webSocket.addEventListener("close", (evt) => {
     log(`websocket closed (code=${evt.code} reason=${evt.reason})`);
     stopKeepalive();
-  };
+  }, { once: true });
 
-  const handleError = (evt) => {
+  webSocket.addEventListener("error", (evt) => {
     log("websocket error", evt);
     stopKeepalive();
-  };
-
-  // Use { once: true } for cleanup events to prevent memory leaks
-  webSocket.addEventListener("close", handleClose, { once: true });
-  webSocket.addEventListener("error", handleError);
+  });
 
   startKeepalive();
 
   const earlyDataHeader = request.headers.get("sec-websocket-protocol") || "";
   const readableWebSocketStream = makeReadableWebSocketStream(webSocket, earlyDataHeader, log);
   const remoteSocketWrapper = { value: null };
-  
-  // Optimized main processing loop with better error handling
+
   const processStream = async () => {
     const reader = readableWebSocketStream.getReader();
     let headerParsed = false;
-    // Persistent TCP writer — acquired once after header is parsed,
-    // held open for the lifetime of the connection (avoids per-chunk lock churn).
-    let tcpWriter = null;
-    // Buffer for chunks that arrive while TCP connection is still being established.
-    // handleTCPOutbound is called without await, so remoteSocketWrapper.value may
-    // not be set yet when the next chunk arrives. Without this buffer those chunks
-    // would fall through both if-branches and be silently dropped.
-    let pendingChunks = [];
-    
+
     try {
       while (isActive) {
         const result = await reader.read();
         if (result.done) break;
-        
         const { value } = result;
-        
-        // Fast path: header parsed AND TCP socket is ready
+
         if (headerParsed && remoteSocketWrapper.value) {
-          // Flush any buffered chunks first (only happens once per connection)
-          if (pendingChunks.length > 0) {
-            if (!tcpWriter) {
-              try {
-                tcpWriter = remoteSocketWrapper.value.writable.getWriter();
-              } catch (err) {
-                log("Failed to acquire TCP writer (flush)", err);
-                break;
-              }
-            }
-            for (const pending of pendingChunks) {
-              try { await tcpWriter.write(pending); }
-              catch (err) { log("Error flushing buffered chunk", err); break; }
-            }
-            pendingChunks = [];
-          }
-          // Lazily acquire the writer once and reuse it
-          if (!tcpWriter) {
-            try {
-              tcpWriter = remoteSocketWrapper.value.writable.getWriter();
-            } catch (err) {
-              log("Failed to acquire TCP writer", err);
-              break;
-            }
-          }
           try {
-            await tcpWriter.write(value);
+            const writer = remoteSocketWrapper.value.writable.getWriter();
+            await writer.write(value);
+            writer.releaseLock();
           } catch (err) {
             log("Error writing to TCP socket", err);
             break;
@@ -573,18 +205,10 @@ async function handleTrojanOverWS(request) {
           continue;
         }
 
-        // Header parsed but TCP not ready yet — buffer the chunk, don't drop it
-        if (headerParsed && !remoteSocketWrapper.value) {
-          pendingChunks.push(value);
-          continue;
-        }
-
-        // Header parsing path (only runs once)
         if (!headerParsed) {
           try {
             const {
-              hasError,
-              message,
+              hasError, message,
               portRemote = 443,
               addressRemote = "",
               rawClientData,
@@ -594,54 +218,30 @@ async function handleTrojanOverWS(request) {
             address = addressRemote;
             portWithRandomLog = `${portRemote}--${logId}`;
 
-            if (hasError) {
-              throw new Error(`Header parse error for ${addressRemote}:${portRemote} - ${message}`);
-            }
+            if (hasError) throw new Error(`Header parse error: ${message}`);
+            if (!isValidPassword(passwordFromClient)) throw new Error("invalid password");
+            if (!addressRemote) throw new Error(`Invalid address for port ${portRemote}`);
 
-            if (!isValidPassword(passwordFromClient)) {
-              throw new Error("invalid password");
-            }
-
-            if (!addressRemote) {
-              throw new Error(`Invalid address received for port ${portRemote}`);
-            }
-
-            log(`Processing TCP outbound connection ${addressRemote}:${portRemote}`);
-            
-            // Mark header as parsed before handling TCP connection
+            log(`Processing TCP outbound ${addressRemote}:${portRemote}`);
             headerParsed = true;
-            
-            // Launch TCP setup asynchronously. Chunks arriving before
-            // remoteSocketWrapper.value is set are buffered in pendingChunks above.
             handleTCPOutbound(remoteSocketWrapper, addressRemote, portRemote, rawClientData, webSocket, log);
-            
+
           } catch (err) {
             log("Header parsing error", err);
             throw err;
           }
         }
       }
-      
     } catch (err) {
       log("Error processing WebSocket stream", err);
       throw err;
-    } 
-    
-    finally {
-      pendingChunks = [];
-      // Release persistent writer if acquired
-      if (tcpWriter) {
-        try { tcpWriter.releaseLock(); } catch {}
-        tcpWriter = null;
-      }
-      // Ensure reader is always released
+    } finally {
       try { reader.releaseLock(); } catch {}
       stopKeepalive();
       safeCloseWebSocket(webSocket);
     }
   };
 
-  // Start processing without awaiting to avoid blocking response
   processStream().catch(err => {
     console.error("Stream processing failed:", err);
     stopKeepalive();
@@ -651,21 +251,6 @@ async function handleTrojanOverWS(request) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-//-----------------------------------------------------------------------------
-// Password Validation (constant-time)
-//-----------------------------------------------------------------------------
-function constantTimeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") return false;
-  const la = a.length, lb = b.length;
-  let res = la === lb ? 0 : 1;
-  const L = Math.max(la, lb);
-  for (let i = 0; i < L; i++) {
-    const ca = i < la ? a.charCodeAt(i) : 0;
-    const cb = i < lb ? b.charCodeAt(i) : 0;
-    res |= ca ^ cb;
-  }
-  return res === 0;
-}
 
 function isValidPassword(clientPwd) {
   if (!clientPwd) return false;
@@ -817,66 +402,10 @@ async function handleTCPOutbound(
    */
   const connectAndWrite = async (address, port) => {
     log(`Connecting to ${address}:${port}`);
-
-    // TLS options for secure connection
-    const tlsOptions = {
-      minVersion: "TLSv1.3",
-      maxVersion: "TLSv1.3",
-      ciphers: "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256",
-      alpnProtocols: ["h3", "h2", "http/1.1"],
-      servername: /^[0-9:.]+$/.test(address) ? undefined : address,
-      honorCipherOrder: true,
-      rejectUnauthorized: true,
-    };
-
-    const tryConnect = async () => {
-      return connect({
-        hostname: address,
-        port,
-        secureTransport: "on",
-        tcpTurbo: true,
-        tlsOptions,
-        keepAlive: true,
-      });
-    };
-
-    let tcpSocket;
-    try {
-      tcpSocket = await tryConnect();
-    } catch (err) {
-      const errStr = err.toString();
-
-      // Keep retry on specific Cloudflare error "1101", but do NOT suppress logging.
-      if (errStr.includes("1101")) {
-        console.warn(`Cloudflare error 1101 for ${address}:${port}; retrying...`, err);
-
-        try {
-          tcpSocket = await tryConnect();
-        } catch (retryErr) {
-          console.error(`Retry failed for ${address}:${port}:`, retryErr);
-          throw new Error(`Error connecting to ${address}:${port} after retry - ${retryErr}`);
-        }
-      } else {
-        // Generic error
-        throw new Error(`Error connecting to ${address}:${port} - ${errStr}`);
-      }
-    }
-
+    // Plain TCP connect — exactly like Index.js. Trojan is a TCP proxy protocol;
+    // TLS is handled by the client, NOT by this worker.
+    const tcpSocket = connect({ hostname: address, port: port });
     remoteSocketWrapper.value = tcpSocket;
-    
-    // Best-effort TCP_NODELAY (low-latency small packets)
-    try {
-      if (typeof tcpSocket.setNoDelay === "function") {
-        tcpSocket.setNoDelay(true);
-      } else if (tcpSocket.socket && typeof tcpSocket.socket.setNoDelay === "function") {
-        tcpSocket.socket.setNoDelay(true);
-      }
-      
-    } catch (e) {
-      // Not fatal; just sample-log.
-      log("setNoDelay failed (non-fatal)");
-    }
-
     const writer = tcpSocket.writable.getWriter();
     try {
       await writer.write(rawClientData);
@@ -942,63 +471,26 @@ async function handleTCPOutbound(
   };
 
   /**
-   * Retry connection:
-   *   1. PROXYIP is set (env/KV/auto-selected) → plain TCP to that proxy.
-   *   2. PROXYIP is empty (edge case — backupIP pool was empty) → direct TLS
-   *      to the original target as a last resort.
-   *
-   * If the first proxy attempt fails, cycle through the full backupIP pool
-   * ordered by proximity to currentWorkerRegion before giving up.
+   * Retry: if PROXYIP is set, try it via plain TCP. Otherwise direct TLS.
    */
   const retry = async () => {
-    // Build candidate list: configured proxyIP first, then full sorted pool
-    const candidates = [];
-
     const parsed = parseProxyIP(proxyIP);
     if (parsed) {
-      candidates.push({ host: parsed.host, port: parsed.port, isProxy: true, label: proxyIP });
-    }
-
-    // Add remaining backupIPs (skip the one already in proxyIP to avoid duplicate)
-    const sortedBackups = getSortedBackupIPs(currentWorkerRegion);
-    for (const b of sortedBackups) {
-      const candidateStr = `${b.domain}:${b.port}`;
-      if (candidateStr !== proxyIP) {
-        candidates.push({ host: b.domain, port: b.port, isProxy: true, label: candidateStr });
-      }
-    }
-
-    // If no proxy candidates at all, fall back to direct TLS (last resort)
-    if (candidates.length === 0) {
-      candidates.push({ host: addressRemote, port: portRemote, isProxy: false, label: `${addressRemote}:${portRemote} (direct)` });
-    }
-
-    for (const candidate of candidates) {
-      log(`Retrying via ${candidate.isProxy ? "proxy" : "direct"} → ${candidate.label}`);
+      log(`Retrying via proxyIP → ${parsed.host}:${parsed.port}`);
       try {
-        const tcpSocket = candidate.isProxy
-          ? await connectAndWritePlain(candidate.host, candidate.port)
-          : await connectAndWrite(candidate.host, candidate.port);
-
+        const tcpSocket = await connectAndWritePlain(parsed.host, parsed.port);
         tcpSocket.closed
-          .catch((err) => log(`Retry TCP socket closed error for ${candidate.label}`, err))
-          .finally(() => {
-            try { if (typeof tcpSocket.close === "function") tcpSocket.close(); } catch {}
-            safeCloseWebSocket(webSocket);
-          });
-
-        // Pass null — no further retry after this level
+          .catch(err => log(`Retry TCP closed error`, err))
+          .finally(() => { try { if (typeof tcpSocket.close === "function") tcpSocket.close(); } catch {} safeCloseWebSocket(webSocket); });
         remoteSocketToWS(tcpSocket, webSocket, null, log);
-        return; // success — stop iterating candidates
       } catch (err) {
-        log(`Candidate ${candidate.label} failed: ${err.message}`);
-        // continue to next candidate
+        log(`Retry failed: ${err}`);
+        safeCloseWebSocket(webSocket);
       }
+    } else {
+      log(`No proxyIP — giving up`);
+      safeCloseWebSocket(webSocket);
     }
-
-    // All candidates exhausted
-    log(`All retry candidates exhausted for ${addressRemote}:${portRemote}`);
-    safeCloseWebSocket(webSocket);
   };
 
   try {
@@ -1493,7 +985,7 @@ function serveConfigPage(pwd, hostName) {
   <div class="header">
     <h1>Trojan Config</h1>
     <p>${hostName}</p>
-    <div class="badge">ECH Enabled · ${currentWorkerRegion || 'Global'}</div>
+    <div class="badge">trojan · workers.dev</div>
   </div>
 
   <div class="card trojan">
@@ -1523,7 +1015,7 @@ function serveConfigPage(pwd, hostName) {
     <div class="hint">Clash YAML via url.v1.mk converter · ECH injected · rule config from byJoey/test.</div>
   </div>
 
-  <div class="footer">trojan-worker · ECH on · ${backupIPs.length} relay pool</div>
+  <div class="footer">trojan-worker</div>
 </div>
 <script>
 function copy(id, btn) {
