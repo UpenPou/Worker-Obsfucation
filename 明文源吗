@@ -254,9 +254,10 @@ export default {
         }
       }
 
-      // 5. ECH — KV key 'ECH' overrides env; default is OFF (false)
-      const echVal = getKV('ECH', env.ECH || env.ech, 'no');
-      enableECH = echVal !== 'no' && echVal !== 'false' && echVal !== '0';
+      // 5. ECH — KV key 'ech' (lowercase) overrides env; default is OFF (false)
+      // Support both 'ech' and 'ECH' keys for compatibility
+      const echVal = kvConfig['ech'] !== undefined ? kvConfig['ech'] : getKV('ECH', env.ECH || env.ech, 'no');
+      enableECH = echVal === 'yes' || echVal === true || echVal === 'true';
 
       // 6. DOH and ECH_DOMAIN — KV keys override env vars
       customDNS = getKV('DOH', env.DOH || env.CUSTOM_DNS || env.customDNS, 'https://cloudflare-dns.com/dns-query');
@@ -380,7 +381,7 @@ export default {
         if (request.method === "POST") {
           try {
             const updates = await request.json();
-            const allowed = new Set(['PROXYIP', 'ECH', 'DOH', 'ECH_DOMAIN', 'KEEPALIVE', 'PASSWORD', 'DKBY']);
+            const allowed = new Set(['PROXYIP', 'ECH', 'ech', 'DOH', 'ECH_DOMAIN', 'KEEPALIVE', 'PASSWORD', 'DKBY']);
             for (const [key, value] of Object.entries(updates)) {
               if (!allowed.has(key)) continue; // silently ignore unknown keys
               if (value === "" || value === null || value === undefined) {
@@ -1556,25 +1557,57 @@ function copy(id, btn) {
   });
 }
 
+async function saveConfig(data) {
+  // Mirror Index.js: POST to {currentPath}/config with lowercase keys
+  const apiUrl = window.location.pathname.replace(/\/$/, '') + '/config';
+  const res = await fetch(apiUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  return res;
+}
+
+async function loadCurrentConfig() {
+  // Mirror Index.js: GET config and set checkbox state from saved KV value
+  const apiUrl = window.location.pathname.replace(/\/$/, '') + '/config';
+  try {
+    const res = await fetch(apiUrl);
+    if (res.ok) {
+      const cfg = await res.json();
+      const toggle = document.getElementById('ech-toggle');
+      const label  = document.getElementById('ech-label');
+      if (toggle) {
+        // Support both 'ech' and 'ECH' keys
+        const echVal = cfg.ech !== undefined ? cfg.ech : (cfg.config && cfg.config.ECH ? cfg.config.ECH.value : 'no');
+        toggle.checked = (echVal === 'yes' || echVal === true || echVal === 'true');
+        label.textContent = toggle.checked ? 'ECH Enabled' : 'ECH Disabled';
+      }
+    }
+  } catch(e) { /* silently ignore */ }
+}
+
 async function toggleECH() {
   const toggle = document.getElementById('ech-toggle');
+  const label  = document.getElementById('ech-label');
   const status = document.getElementById('ech-status');
   toggle.disabled = true;
   status.textContent = 'Saving...';
   status.style.color = '#64748b';
   const newVal = toggle.checked ? 'yes' : 'no';
-  // POST to the correct config endpoint with uppercase ECH key
-  const configUrl = window.location.pathname.replace(/\/$/, '') + '/config';
   try {
-    const res = await fetch(configUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ECH: newVal })
-    });
+    // Use lowercase 'ech' key — same as Index.js
+    const res = await saveConfig({ ech: newVal, ECH: newVal });
     if (res.ok) {
+      label.textContent = toggle.checked ? 'ECH Enabled' : 'ECH Disabled';
       status.textContent = 'Saved! Reloading...';
       status.style.color = '#10b981';
-      setTimeout(() => window.location.reload(), 800);
+      setTimeout(() => window.location.reload(), 1500);
+    } else if (res.status === 503) {
+      status.textContent = 'KV not configured. Bind a KV namespace in wrangler.toml.';
+      status.style.color = '#ef4444';
+      toggle.checked = !toggle.checked;
+      toggle.disabled = false;
     } else {
       const err = await res.json().catch(() => ({}));
       status.textContent = 'Save failed: ' + (err.error || res.status);
@@ -1589,6 +1622,9 @@ async function toggleECH() {
     toggle.disabled = false;
   }
 }
+
+// On page load: read current KV config and sync checkbox state
+window.addEventListener('DOMContentLoaded', loadCurrentConfig);
 </script>
 </body>
 </html>`;
