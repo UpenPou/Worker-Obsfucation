@@ -1505,7 +1505,7 @@ function serveConfigPage(pwd, hostName) {
       <div class="link-box" id="v2ray-box">${v2rayLink}</div>
       <button class="copy-btn v" onclick="copy('v2ray-box', this)">COPY</button>
     </div>
-    <div class="hint">Base64 sub — ${sorted_count} nodes (worker + all regional backupIPs). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
+    <div class="hint">Base64 sub — ${backupIPs.length + 1} nodes (worker + all regional backupIPs). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
   </div>
 
   <div class="card clash">
@@ -1531,7 +1531,7 @@ function copy(id, btn) {
 }
 </script>
 </body>
-</html>`.replace('${sorted_count}', String(backupIPs.length + 1));
+</html>`;
 }
 
 //-----------------------------------------------------------------------------
