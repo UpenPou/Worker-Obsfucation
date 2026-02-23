@@ -16,10 +16,12 @@ const textDecoder = new TextDecoder();
 // writes them before any request logic runs.
 let password = "";
 let sha224Password;
+
 let proxyIP = "";
 
 let keepaliveMs = 0;
-let enableECH = true;
+
+let enableECH = false;
 let customDNS = 'https://cloudflare-dns.com/dns-query';
 let customECHDomain = 'cloudflare-ech.com';
 
@@ -254,8 +256,8 @@ export default {
         }
       }
 
-      // 5. ECH — KV key 'ECH' overrides env; default is ON (true)
-      const echVal = getKV('ECH', env.ECH || env.ech, 'yes');
+      // 5. ECH — KV key 'ECH' overrides env; default is OFF (false)
+      const echVal = getKV('ECH', env.ECH || env.ech, 'no');
       enableECH = echVal !== 'no' && echVal !== 'false' && echVal !== '0';
 
       // 6. DOH and ECH_DOMAIN — KV keys override env vars
@@ -1501,7 +1503,7 @@ function serveConfigPage(pwd, hostName) {
   <div class="header">
     <h1>Trojan Config</h1>
     <p>${hostName}</p>
-    <div class="badge">ECH Enabled · ${currentWorkerRegion || 'Global'}</div>
+    <div class="badge">${enableECH ? "ECH Enabled" : "ECH Disabled"} · ${currentWorkerRegion || 'Global'}</div>
   </div>
 
   <div class="card trojan">
@@ -1519,7 +1521,7 @@ function serveConfigPage(pwd, hostName) {
       <div class="link-box" id="v2ray-box">${v2rayLink}</div>
       <button class="copy-btn v" onclick="copy('v2ray-box', this)">COPY</button>
     </div>
-    <div class="hint">Base64 sub — 10 nodes (worker hostname + 9 CF anycast IPs, all with ECH). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
+    <div class="hint">Base64 sub — 10 nodes (worker hostname + 9 CF anycast IPs). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
   </div>
 
   <div class="card clash">
@@ -1528,10 +1530,22 @@ function serveConfigPage(pwd, hostName) {
       <div class="link-box" id="clash-box">${clashLink}</div>
       <button class="copy-btn c" onclick="copy('clash-box', this)">COPY</button>
     </div>
-    <div class="hint">Clash YAML via url.v1.mk converter · ECH injected · rule config from byJoey/test.</div>
+    <div class="hint">Clash YAML via url.v1.mk converter · rule config from byJoey/test.</div>
   </div>
 
-  <div class="footer">trojan-worker · ECH on · ${backupIPs.length} relay pool</div>
+  <div class="card" style="border-color: rgba(124,58,237,0.3);">
+    <div class="card-label" style="color:#7c3aed;">⬡ ECH Settings</div>
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;">
+      <label style="display:flex;align-items:center;gap:0.6rem;cursor:pointer;">
+        <input type="checkbox" id="ech-toggle" onchange="toggleECH()" ${enableECH ? 'checked' : ''} style="width:1.1rem;height:1.1rem;accent-color:#7c3aed;cursor:pointer;">
+        <span id="ech-label" style="font-size:0.8rem;">${enableECH ? 'ECH Enabled' : 'ECH Disabled'}</span>
+      </label>
+      <span id="ech-status" style="font-size:0.7rem;color:#64748b;"></span>
+    </div>
+    <div class="hint">ECH hides your SNI from network observers. Disable if your client shows SSL errors (Karing, Hiddify). Change takes effect after page reload.</div>
+  </div>
+
+  <div class="footer">trojan-worker · ECH ${enableECH ? "on" : "off"} · ${backupIPs.length} relay pool</div>
 </div>
 <script>
 function copy(id, btn) {
@@ -1542,6 +1556,36 @@ function copy(id, btn) {
     btn.classList.add('copied');
     setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1800);
   });
+}
+
+async function toggleECH() {
+  const toggle = document.getElementById('ech-toggle');
+  const label  = document.getElementById('ech-label');
+  const status = document.getElementById('ech-status');
+  toggle.disabled = true;
+  status.textContent = 'Saving...';
+  const newVal = toggle.checked ? 'yes' : 'no';
+  try {
+    const res = await fetch(window.location.href, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ech: newVal })
+    });
+    if (res.ok) {
+      label.textContent = toggle.checked ? 'ECH Enabled' : 'ECH Disabled';
+      status.textContent = 'Saved! Reload to get updated links.';
+      status.style.color = '#10b981';
+    } else {
+      status.textContent = 'Save failed. Try again.';
+      status.style.color = '#ef4444';
+      toggle.checked = !toggle.checked;
+    }
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    status.style.color = '#ef4444';
+    toggle.checked = !toggle.checked;
+  }
+  toggle.disabled = false;
 }
 </script>
 </body>
@@ -1559,23 +1603,24 @@ function copy(id, btn) {
  * @returns {string} The Trojan URI.
  */
 function buildTrojanLink(pwd, hostName) {
-  // ECH always enabled — fp=chrome required for ECH
-  const echDomain = customECHDomain || 'cloudflare-ech.com';
-  const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
-
   const params = new URLSearchParams({
     type:          "ws",
     host:          hostName,
     path:          "/api/v1/health",
     security:      "tls",
     sni:           hostName,
-    alpn:          "h3",
-    fp:            "chrome",
+    fp:            enableECH ? "chrome" : "random",
     allowInsecure: "0",
     fastopen:      "true",
     earlyDataSize: "0",
   });
-  params.set('ech', echDomain + '+' + dnsServer);
+
+  // Only add ECH params when ECH is enabled
+  if (enableECH) {
+    const echDomain = customECHDomain || 'cloudflare-ech.com';
+    const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+    params.set('ech', echDomain + '+' + dnsServer);
+  }
 
   return 'trojan://' + encodeURIComponent(pwd) + '@' + hostName + ':443/?' + params.toString();
 }
