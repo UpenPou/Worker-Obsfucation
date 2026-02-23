@@ -16,11 +16,9 @@ const textDecoder = new TextDecoder();
 // writes them before any request logic runs.
 let password = "";
 let sha224Password;
-
 let proxyIP = "";
 
 let keepaliveMs = 0;
-
 let enableECH = false;
 let customDNS = 'https://cloudflare-dns.com/dns-query';
 let customECHDomain = 'cloudflare-ech.com';
@@ -1560,10 +1558,10 @@ function copy(id, btn) {
 
 async function toggleECH() {
   const toggle = document.getElementById('ech-toggle');
-  const label  = document.getElementById('ech-label');
   const status = document.getElementById('ech-status');
   toggle.disabled = true;
   status.textContent = 'Saving...';
+  status.style.color = '#64748b';
   const newVal = toggle.checked ? 'yes' : 'no';
   try {
     const res = await fetch(window.location.href, {
@@ -1572,20 +1570,22 @@ async function toggleECH() {
       body: JSON.stringify({ ech: newVal })
     });
     if (res.ok) {
-      label.textContent = toggle.checked ? 'ECH Enabled' : 'ECH Disabled';
-      status.textContent = 'Saved! Reload to get updated links.';
+      status.textContent = 'Saved! Reloading...';
       status.style.color = '#10b981';
+      // Auto-reload after 800ms so the page reflects the new ECH state
+      setTimeout(() => window.location.reload(), 800);
     } else {
       status.textContent = 'Save failed. Try again.';
       status.style.color = '#ef4444';
       toggle.checked = !toggle.checked;
+      toggle.disabled = false;
     }
   } catch(e) {
     status.textContent = 'Error: ' + e.message;
     status.style.color = '#ef4444';
     toggle.checked = !toggle.checked;
+    toggle.disabled = false;
   }
-  toggle.disabled = false;
 }
 </script>
 </body>
