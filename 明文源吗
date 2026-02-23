@@ -1271,28 +1271,21 @@ function safeCloseWebSocket(socket, code = 1000, reason = '') {
 function generateTrojanNodes(pwd, hostName) {
   const echDomain = customECHDomain || 'cloudflare-ech.com';
   const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
+  const echSuffix = `&alpn=h3%2Ch2%2Chttp%2F1.1&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
   const links = [];
 
-  // Common params — SNI and Host always point to the worker domain
-  const baseParams = () => new URLSearchParams({
-    security: 'tls',
-    sni:      hostName,
-    fp:       'chrome',
-    type:     'ws',
-    host:     hostName,
-    path:     '/api/v1/health',
-    alpn:     'h2,http/1.1',
-    ech:      `${echDomain}+${dnsServer}`,
-  });
+  // Build a single trojan link — same format as Index.js generateTrojanLinksFromSource.
+  // server=ip/hostname, but SNI+host always = worker domain so CF routes correctly.
+  const makeLink = (server, label) => {
+    const base = `trojan://${encodeURIComponent(pwd)}@${server}:443` +
+      `?security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}&path=%2F%3Fed%3D2048`;
+    return base + echSuffix + `#${encodeURIComponent(label)}`;
+  };
 
-  // 1. Primary node — worker hostname (CF resolves to nearest edge PoP)
-  links.push(
-    `trojan://${encodeURIComponent(pwd)}@${hostName}:443?${baseParams().toString()}` +
-    `#${encodeURIComponent('🌐 ' + hostName)}`
-  );
+  // 1. Primary — worker hostname direct
+  links.push(makeLink(hostName, '🌐 ' + hostName));
 
-  // 2. Cloudflare anycast IPs — client connects to these but presents hostName
-  //    as SNI so Cloudflare routes the request to the correct worker.
+  // 2. Cloudflare anycast IPs — SNI=hostName so CF routes to the correct worker
   const cfIPs = [
     { ip: '104.21.0.1',    label: 'CF-US-1' },
     { ip: '172.67.0.1',    label: 'CF-US-2' },
@@ -1306,10 +1299,7 @@ function generateTrojanNodes(pwd, hostName) {
   ];
 
   for (const { ip, label } of cfIPs) {
-    links.push(
-      `trojan://${encodeURIComponent(pwd)}@${ip}:443?${baseParams().toString()}` +
-      `#${encodeURIComponent('⚡ ' + label)}`
-    );
+    links.push(makeLink(ip, '⚡ ' + label));
   }
 
   return links;
@@ -1572,21 +1562,17 @@ function buildTrojanLink(pwd, hostName) {
   const echDomain = customECHDomain || 'cloudflare-ech.com';
   const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
 
-  const params = new URLSearchParams({
-    type:          "ws",
-    host:          hostName,
-    path:          "/api/v1/health",
-    security:      "tls",
-    sni:           hostName,
-    alpn:          "h2,http/1.1",
-    fp:            "chrome",
-    allowInsecure: "0",
-    fastopen:      "true",
-    earlyDataSize: "0",
-    ech:           `${echDomain}+${dnsServer}`,
-  });
+  // Base params — matches Index.js generateTrojanLinksFromSource format exactly.
+  // path=/?ed=2048 enables WS early-data (0-RTT). No allowInsecure or earlyDataSize.
+  let link = `trojan://${encodeURIComponent(pwd)}@${hostName}:443` +
+    `?security=tls&sni=${hostName}&fp=chrome&type=ws&host=${hostName}&path=%2F%3Fed%3D2048`;
 
-  return `trojan://${encodeURIComponent(pwd)}@${hostName}:443/?${params.toString()}`;
+  // alpn + ech appended the same way Index.js does it
+  link += `&alpn=h3%2Ch2%2Chttp%2F1.1&ech=${encodeURIComponent(`${echDomain}+${dnsServer}`)}`;
+
+  link += `#${encodeURIComponent(hostName)}`;
+
+  return link;
 }
 
 //-----------------------------------------------------------------------------
