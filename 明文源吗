@@ -1563,19 +1563,21 @@ async function toggleECH() {
   status.textContent = 'Saving...';
   status.style.color = '#64748b';
   const newVal = toggle.checked ? 'yes' : 'no';
+  // POST to the correct config endpoint with uppercase ECH key
+  const configUrl = window.location.pathname.replace(/\/$/, '') + '/config';
   try {
-    const res = await fetch(window.location.href, {
+    const res = await fetch(configUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ech: newVal })
+      body: JSON.stringify({ ECH: newVal })
     });
     if (res.ok) {
       status.textContent = 'Saved! Reloading...';
       status.style.color = '#10b981';
-      // Auto-reload after 800ms so the page reflects the new ECH state
       setTimeout(() => window.location.reload(), 800);
     } else {
-      status.textContent = 'Save failed. Try again.';
+      const err = await res.json().catch(() => ({}));
+      status.textContent = 'Save failed: ' + (err.error || res.status);
       status.style.color = '#ef4444';
       toggle.checked = !toggle.checked;
       toggle.disabled = false;
