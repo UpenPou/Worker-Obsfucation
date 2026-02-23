@@ -1256,36 +1256,60 @@ function safeCloseWebSocket(socket, code = 1000, reason = '') {
 }
 
 //-----------------------------------------------------------------------------
-// Generate Trojan nodes for all backupIPs + worker hostname
+// Generate Trojan nodes for subscription import.
+//
+// KEY ARCHITECTURE POINT:
+// The client ALWAYS connects to the Cloudflare worker (hostName). The proxyIP
+// is used INTERNALLY by the worker to relay TCP onward — the client never
+// connects to a proxyIP directly. Giving the client nodes pointing at backupIP
+// domains causes SSL errors because those relays don't speak Trojan-over-WS.
+//
+// To give users multiple nodes we generate one node per Cloudflare CDN anycast
+// IP with hostName as SNI/host — same approach Index.js uses with preferred IPs.
 // Returns an array of trojan:// URI strings.
 //-----------------------------------------------------------------------------
 function generateTrojanNodes(pwd, hostName) {
   const echDomain = customECHDomain || 'cloudflare-ech.com';
   const dnsServer = customDNS || 'https://cloudflare-dns.com/dns-query';
-  const echParam = encodeURIComponent(`${echDomain}+${dnsServer}`);
-  const wsPath = encodeURIComponent('/api/v1/health');
   const links = [];
 
-  // 1. Primary node — the worker hostname itself on port 443
-  const primaryParams = new URLSearchParams({
-    security: 'tls', sni: hostName, fp: 'chrome',
-    type: 'ws', host: hostName, path: '/api/v1/health',
-    alpn: 'h3,h2,http/1.1',
-    ech: `${echDomain}+${dnsServer}`,
+  // Common params — SNI and Host always point to the worker domain
+  const baseParams = () => new URLSearchParams({
+    security: 'tls',
+    sni:      hostName,
+    fp:       'chrome',
+    type:     'ws',
+    host:     hostName,
+    path:     '/api/v1/health',
+    alpn:     'h2,http/1.1',
+    ech:      `${echDomain}+${dnsServer}`,
   });
-  links.push(`trojan://${encodeURIComponent(pwd)}@${hostName}:443?${primaryParams.toString()}#${encodeURIComponent('🌐 ' + hostName)}`);
 
-  // 2. One node per backupIP, sorted by proximity to the current worker region
-  const sorted = getSortedBackupIPs(currentWorkerRegion);
-  for (const b of sorted) {
-    const label = `🔁 ProxyIP-${b.regionCode || b.domain.split('.')[1] || 'relay'}`;
-    const params = new URLSearchParams({
-      security: 'tls', sni: hostName, fp: 'chrome',
-      type: 'ws', host: hostName, path: '/api/v1/health',
-      alpn: 'h3,h2,http/1.1',
-      ech: `${echDomain}+${dnsServer}`,
-    });
-    links.push(`trojan://${encodeURIComponent(pwd)}@${b.domain}:${b.port}?${params.toString()}#${encodeURIComponent(label)}`);
+  // 1. Primary node — worker hostname (CF resolves to nearest edge PoP)
+  links.push(
+    `trojan://${encodeURIComponent(pwd)}@${hostName}:443?${baseParams().toString()}` +
+    `#${encodeURIComponent('🌐 ' + hostName)}`
+  );
+
+  // 2. Cloudflare anycast IPs — client connects to these but presents hostName
+  //    as SNI so Cloudflare routes the request to the correct worker.
+  const cfIPs = [
+    { ip: '104.21.0.1',    label: 'CF-US-1' },
+    { ip: '172.67.0.1',    label: 'CF-US-2' },
+    { ip: '162.159.0.1',   label: 'CF-US-3' },
+    { ip: '104.16.0.1',    label: 'CF-US-4' },
+    { ip: '104.17.0.1',    label: 'CF-US-5' },
+    { ip: '141.101.64.1',  label: 'CF-EU-1' },
+    { ip: '108.162.192.1', label: 'CF-EU-2' },
+    { ip: '190.93.240.1',  label: 'CF-AP-1' },
+    { ip: '188.114.96.1',  label: 'CF-AP-2' },
+  ];
+
+  for (const { ip, label } of cfIPs) {
+    links.push(
+      `trojan://${encodeURIComponent(pwd)}@${ip}:443?${baseParams().toString()}` +
+      `#${encodeURIComponent('⚡ ' + label)}`
+    );
   }
 
   return links;
@@ -1505,7 +1529,7 @@ function serveConfigPage(pwd, hostName) {
       <div class="link-box" id="v2ray-box">${v2rayLink}</div>
       <button class="copy-btn v" onclick="copy('v2ray-box', this)">COPY</button>
     </div>
-    <div class="hint">Base64 sub — ${backupIPs.length + 1} nodes (worker + all regional backupIPs). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
+    <div class="hint">Base64 sub — 10 nodes (worker hostname + 9 CF anycast IPs, all with ECH). Import into V2RayN, Shadowrocket, Nekoray, etc.</div>
   </div>
 
   <div class="card clash">
@@ -1554,7 +1578,7 @@ function buildTrojanLink(pwd, hostName) {
     path:          "/api/v1/health",
     security:      "tls",
     sni:           hostName,
-    alpn:          "h3",
+    alpn:          "h2,http/1.1",
     fp:            "chrome",
     allowInsecure: "0",
     fastopen:      "true",
