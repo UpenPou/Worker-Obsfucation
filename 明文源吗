@@ -406,9 +406,6 @@ export default {
       // Validate WebSocket upgrade.
       const upgradeHeader = request.headers.get("Upgrade");
       const websocketKey = request.headers.get("sec-websocket-key");
-      const allowedProtocols = ["ws", "wss", "voip"];
-      const subprotocol = request.headers.get("sec-websocket-protocol") || "";
-
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket" || !websocketKey) {
         return new Response(
           "This node is for WebSocket connections only. Use '/<your-password>' for Trojan configuration.",
@@ -416,9 +413,9 @@ export default {
         );
       }
 
-      if (subprotocol && !allowedProtocols.includes(subprotocol.toLowerCase())) {
-        return new Response("Unsupported WebSocket subprotocol.", { status: 400 });
-      }
+      // NOTE: Do NOT reject unknown subprotocols — clients using path=/?ed=2048
+      // send early data as a base64 string in sec-websocket-protocol.
+      // Cloudflare Workers echo it back automatically via webSocket.accept().
 
       // Initiate Trojan-over-WebSocket handling.
       const trojanPromise = handleTrojanOverWS(request);
